@@ -1,17 +1,44 @@
 import pandas as pd
 import os
-import shutil
+import json
+import hashlib
 from sqlalchemy import create_engine, text
 
-DB_NAME = "merged_database.db"
-PROCESSED_FOLDER = "files"
+# ===============================
+# DATABASE CONNECTION (use env variable in cloud)
+# ===============================
+DB_URL = os.environ.get("DB_URL", "sqlite:///merged_database.db")
+engine = create_engine(DB_URL)
 
-engine = create_engine(f"sqlite:///{DB_NAME}")
+STATE_FILE = "file_state.json"
+EXCEL_FOLDER = "excel"
 
-# Create folder for processed files if it doesn't exist
-if not os.path.exists(PROCESSED_FOLDER):
-    os.makedirs(PROCESSED_FOLDER)
+# ===============================
+# LOAD & SAVE STATE (hash memory)
+# ===============================
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+# ===============================
+# FILE HASH FUNCTION (NEW ⭐)
+# ===============================
+def get_file_hash(path):
+    hasher = hashlib.md5()
+    with open(path, "rb") as f:
+        while chunk := f.read(8192):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+# ===============================
+# DATA CLEANING (your original logic)
+# ===============================
 def optimize_dataframe(df):
     df = df.dropna(how="all")
     df = df.dropna(axis=1, how="all")
@@ -33,26 +60,45 @@ def optimize_dataframe(df):
 
     return df
 
+# ===============================
+# CHECK IF TABLE EXISTS
+# ===============================
 def table_exists(table_name):
     with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT name FROM sqlite_master WHERE type='table' AND name=:name"),
-            {"name": table_name}
-        ).fetchone()
+        result = conn.execute(text("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name=:name
+        """), {"name": table_name}).fetchone()
         return result is not None
 
-excel_files = [f for f in os.listdir() if f.endswith((".xlsx", ".xls"))]
+# ===============================
+# MAIN PROCESS
+# ===============================
+file_state = load_state()
+
+if not os.path.exists(EXCEL_FOLDER):
+    print("Excel folder not found.")
+    exit()
+
+excel_files = [f for f in os.listdir(EXCEL_FOLDER) if f.endswith((".xlsx", ".xls"))]
 
 if not excel_files:
     print("No Excel files found.")
-    input("Press Enter to exit...")
     exit()
 
 for file in excel_files:
-    print(f"\nProcessing {file} ...")
+    path = os.path.join(EXCEL_FOLDER, file)
+    current_hash = get_file_hash(path)
+
+    # Skip unchanged files
+    if file in file_state and file_state[file] == current_hash:
+        print(f"Skipping {file} (unchanged)")
+        continue
+
+    print(f"Processing updated file: {file}")
 
     try:
-        df = pd.read_excel(file)
+        df = pd.read_excel(path)
         df = optimize_dataframe(df)
         table_name = os.path.splitext(file)[0]
 
@@ -61,16 +107,13 @@ for file in excel_files:
         else:
             df.to_sql(table_name, engine, if_exists="replace", index=False)
 
-        # Move processed file to /files folder
-        shutil.move(file, os.path.join(PROCESSED_FOLDER, file))
-        print(f"{file} moved to /files folder")
+        # Save new hash after success
+        file_state[file] = current_hash
+        print(f"{file} uploaded successfully")
 
     except Exception as e:
         print(f"Error processing {file}: {e}")
 
-print("\nOptimizing database...")
-with engine.connect() as conn:
-    conn.execute(text("VACUUM"))
-
-print("DONE ✅")
-input("Press Enter to exit...")
+# Save state for next run
+save_state(file_state)
+print("State saved. Job finished ✅")
